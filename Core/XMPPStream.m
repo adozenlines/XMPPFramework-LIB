@@ -43,9 +43,13 @@
 #define TAG_XMPP_WRITE_STREAM       201
 #define TAG_XMPP_WRITE_RECEIPT      202
 
+// Define the timeouts (in seconds) for SRV
+#define TIMEOUT_SRV_RESOLUTION 30.0
+
 NSString *const XMPPStreamErrorDomain = @"XMPPStreamErrorDomain";
 NSString *const XMPPStreamDidChangeMyJIDNotification = @"XMPPStreamDidChangeMyJID";
 
+const NSTimeInterval XMPPStreamTimeoutNone = -1;
 
 enum XMPPStreamFlags
 {
@@ -82,6 +86,8 @@ enum XMPPStreamConfig
 	dispatch_queue_t willReceivePresenceQueue;
 	
 	dispatch_queue_t didReceiveIqQueue;
+    
+    dispatch_source_t connectTimer;
 	
 	GCDMulticastDelegate <XMPPStreamDelegate> *multicastDelegate;
 	
@@ -102,6 +108,7 @@ enum XMPPStreamConfig
 	UInt16 hostPort;
 	
 	id <XMPPSASLAuthentication> auth;
+	NSDate *authenticationDate;
 	
 	XMPPJID *myJID_setByClient;
 	XMPPJID *myJID_setByServer;
@@ -141,6 +148,10 @@ enum XMPPStreamConfig
 - (void)continueHandleBinding:(NSString *)alternativeResource;
 - (void)setupKeepAliveTimer;
 - (void)keepAlive;
+
+- (void)startConnectTimeout:(NSTimeInterval)timeout;
+- (void)endConnectTimeout;
+- (void)doConnectTimeout;
 
 - (void)continueReceiveMessage:(XMPPMessage *)message;
 - (void)continueReceiveIQ:(XMPPIQ *)iq;
@@ -814,6 +825,27 @@ enum XMPPStreamConfig
 }
 
 /**
+ * Returns YES is the connection is currently connecting
+ **/
+
+- (BOOL)isConnecting
+{
+	XMPPLogTrace();
+	
+	__block BOOL result = NO;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		result = (state == STATE_XMPP_CONNECTING);
+	}};
+	
+	if (dispatch_get_specific(xmppQueueTag))
+		block();
+	else
+		dispatch_sync(xmppQueue, block);
+	
+	return result;
+}
+/**
  * Returns YES if the connection is open, and the stream has been properly established.
  * If the stream is neither disconnected, nor connected, then a connection is currently being established.
 **/
@@ -834,10 +866,92 @@ enum XMPPStreamConfig
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Connect Timeout
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Start Connect Timeout
+**/
+
+- (void)startConnectTimeout:(NSTimeInterval)timeout
+{
+    XMPPLogTrace();
+
+	if (timeout >= 0.0 && !connectTimer)
+	{
+		connectTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, xmppQueue);
+		
+		dispatch_source_set_event_handler(connectTimer, ^{ @autoreleasepool {
+			
+			[self doConnectTimeout];
+		}});
+		
+#if !OS_OBJECT_USE_OBJC
+		dispatch_source_t theConnectTimer = connectTimer;
+		dispatch_source_set_cancel_handler(connectTimer, ^{            
+            XMPPLogVerbose(@"%@: dispatch_release(connectTimer)", THIS_FILE);
+			dispatch_release(theConnectTimer);
+		});
+#endif
+		
+		dispatch_time_t tt = dispatch_time(DISPATCH_TIME_NOW, (timeout * NSEC_PER_SEC));
+		dispatch_source_set_timer(connectTimer, tt, DISPATCH_TIME_FOREVER, 0);
+		
+		dispatch_resume(connectTimer);
+	}
+}
+
+/**
+ * End Connect Timeout
+**/
+
+- (void)endConnectTimeout
+{
+	XMPPLogTrace();
+	
+	if (connectTimer)
+	{
+		dispatch_source_cancel(connectTimer);
+		connectTimer = NULL;
+	}
+}
+
+/**
+ * Connect has timed out, so inform the delegates and close the connection
+**/
+
+- (void)doConnectTimeout
+{
+	XMPPLogTrace();
+	
+	[self endConnectTimeout];
+    		
+    if (state != STATE_XMPP_DISCONNECTED)
+    {
+        [multicastDelegate xmppStreamConnectDidTimeout:self];
+
+        if (state == STATE_XMPP_RESOLVING_SRV)
+        {
+            [srvResolver stop];
+            srvResolver = nil;
+            
+            state = STATE_XMPP_DISCONNECTED;
+        }
+        else
+        {
+            [asyncSocket disconnect];
+            
+            // Everthing will be handled in socketDidDisconnect:withError:
+        }
+    }
+
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark C2S Connection
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-- (BOOL)connectToHost:(NSString *)host onPort:(UInt16)port error:(NSError **)errPtr
+- (BOOL)connectToHost:(NSString *)host onPort:(UInt16)port withTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr
 {
 	NSAssert(dispatch_get_specific(xmppQueueTag), @"Invoked on incorrect queue");
 	
@@ -851,10 +965,15 @@ enum XMPPStreamConfig
 		numberOfBytesReceived = 0;
 	}
 	
+	if(result)
+    {
+        [self startConnectTimeout:timeout];
+    }
+	
 	return result;
 }
 
-- (BOOL)connect:(NSError **)errPtr
+- (BOOL)connectWithTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr
 {
 	XMPPLogTrace();
 	
@@ -926,7 +1045,7 @@ enum XMPPStreamConfig
 			
 			NSString *srvName = [XMPPSRVResolver srvNameFromXMPPDomain:[myJID_setByClient domain]];
 			
-			[srvResolver startWithSRVName:srvName timeout:30.0];
+			[srvResolver startWithSRVName:srvName timeout:TIMEOUT_SRV_RESOLUTION];
 			
 			result = YES;
 		}
@@ -937,7 +1056,7 @@ enum XMPPStreamConfig
 			state = STATE_XMPP_CONNECTING;
 			
 			NSError *connectErr = nil;
-			result = [self connectToHost:hostName onPort:hostPort error:&connectErr];
+			result = [self connectToHost:hostName onPort:hostPort withTimeout:XMPPStreamTimeoutNone error:&connectErr];
 			
 			if (!result)
 			{
@@ -945,6 +1064,11 @@ enum XMPPStreamConfig
 				state = STATE_XMPP_DISCONNECTED;
 			}
 		}
+        
+        if(result)
+        {
+            [self startConnectTimeout:timeout];
+        }
 	}};
 	
 	if (dispatch_get_specific(xmppQueueTag))
@@ -958,7 +1082,7 @@ enum XMPPStreamConfig
 	return result;
 }
 
-- (BOOL)oldSchoolSecureConnect:(NSError **)errPtr
+- (BOOL)oldSchoolSecureConnectWithTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr
 {
 	XMPPLogTrace();
 	
@@ -969,7 +1093,7 @@ enum XMPPStreamConfig
 		
 		// Go through the regular connect routine
 		NSError *connectErr = nil;
-		result = [self connect:&connectErr];
+		result = [self connectWithTimeout:timeout error:&connectErr];
 		
 		if (result)
 		{
@@ -1006,7 +1130,7 @@ enum XMPPStreamConfig
  * The given address is specified as a sockaddr structure wrapped in a NSData object.
  * For example, a NSData object returned from NSNetservice's addresses method.
 **/
-- (BOOL)connectTo:(XMPPJID *)jid withAddress:(NSData *)remoteAddr error:(NSError **)errPtr
+- (BOOL)connectTo:(XMPPJID *)jid withAddress:(NSData *)remoteAddr withTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr
 {
 	XMPPLogTrace();
 	
@@ -1067,6 +1191,11 @@ enum XMPPStreamConfig
 			numberOfBytesSent = 0;
 			numberOfBytesReceived = 0;
 		}
+        
+        if(result)
+        {
+            [self startConnectTimeout:timeout];
+        }
 	}};
 	
 	if (dispatch_get_specific(xmppQueueTag))
@@ -1246,6 +1375,7 @@ enum XMPPStreamConfig
 	else
 		dispatch_async(xmppQueue, block);
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Security
@@ -1740,6 +1870,24 @@ enum XMPPStreamConfig
 	return result;
 }
 
+- (BOOL)isAuthenticating{
+	
+	XMPPLogTrace();
+	
+	__block BOOL result = NO;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		result = (state == STATE_XMPP_AUTH);
+	}};
+	
+	if (dispatch_get_specific(xmppQueueTag))
+		block();
+	else
+		dispatch_sync(xmppQueue, block);
+
+	return result;
+}
+
 - (BOOL)isAuthenticated
 {
 	__block BOOL result = NO;
@@ -1760,15 +1908,117 @@ enum XMPPStreamConfig
 {
 	dispatch_block_t block = ^{
 		if(flag)
+		{
 			flags |= kIsAuthenticated;
+			authenticationDate = [NSDate date];
+		}
 		else
+		{
 			flags &= ~kIsAuthenticated;
+			authenticationDate = nil;
+		}
 	};
 	
 	if (dispatch_get_specific(xmppQueueTag))
 		block();
 	else
 		dispatch_async(xmppQueue, block);
+}
+
+- (NSDate *)authenticationDate{
+	__block NSDate *result = nil;
+	
+	dispatch_block_t block = ^{
+		if(flags & kIsAuthenticated)
+		{
+			result =  authenticationDate;
+		}
+	};
+	
+	if (dispatch_get_specific(xmppQueueTag))
+		block();
+	else
+		dispatch_sync(xmppQueue, block);
+	
+	return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Compression
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (NSArray *)supportedCompressionMethods
+{
+	__block NSMutableArray *result = [[NSMutableArray alloc] init];
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		// The root element can be properly queried for compression methods anytime after the
+		// stream:features are received, and TLS has been setup (if required).
+		
+		if (state >= STATE_XMPP_POST_NEGOTIATION)
+		{
+			NSXMLElement *features = [rootElement elementForName:@"stream:features"];
+			NSXMLElement *compression = [features elementForName:@"compression" xmlns:@"http://jabber.org/features/compress"];
+			
+			NSArray *methods = [compression elementsForName:@"method"];
+			
+			for (NSXMLElement *method in methods)
+			{
+				[result addObject:[method stringValue]];
+			}
+		}
+	}};
+	
+	if (dispatch_get_specific(xmppQueueTag))
+		block();
+	else
+		dispatch_sync(xmppQueue, block);
+	
+	return result;
+}
+
+/**
+ * This method checks the stream features of the connected server to determine
+ * if the given compression method is supported.
+ *
+ * If we are not connected to a server, this method simply returns NO.
+ **/
+
+
+- (BOOL)supportsCompressionMethod:(NSString *)compressionMethod
+{
+	__block BOOL result = NO;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		// The root element can be properly queried for compression methods anytime after the
+		// stream:features are received, and TLS has been setup (if required).
+		
+		if (state >= STATE_XMPP_POST_NEGOTIATION)
+		{
+			NSXMLElement *features = [rootElement elementForName:@"stream:features"];
+			NSXMLElement *compression = [features elementForName:@"compression" xmlns:@"http://jabber.org/features/compress"];
+			
+			NSArray *methods = [compression elementsForName:@"method"];
+			
+			for (NSXMLElement *method in methods)
+			{
+				if ([[method stringValue] isEqualToString:compressionMethod])
+				{
+					result = YES;
+					break;
+				}
+			}
+		}
+	}};
+	
+	if (dispatch_get_specific(xmppQueueTag))
+		block();
+	else
+		dispatch_sync(xmppQueue, block);
+	
+	return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2899,6 +3149,7 @@ enum XMPPStreamConfig
 			
 			NSXMLElement *iq = [NSXMLElement elementWithName:@"iq"];
 			[iq addAttributeWithName:@"type" stringValue:@"set"];
+			[iq addAttributeWithName:@"id" stringValue:[self generateUUID]];
 			[iq addChild:bind];
 			
 			NSString *outgoingStr = [iq compactXMLString];
@@ -2919,6 +3170,7 @@ enum XMPPStreamConfig
 			
 			NSXMLElement *iq = [NSXMLElement elementWithName:@"iq"];
 			[iq addAttributeWithName:@"type" stringValue:@"set"];
+			[iq addAttributeWithName:@"id" stringValue:[self generateUUID]];
 			[iq addChild:bind];
 			
 			NSString *outgoingStr = [iq compactXMLString];
@@ -2996,14 +3248,9 @@ enum XMPPStreamConfig
 }
 
 /**
- * After the authenticateWithPassword:error: or authenticateWithFacebookAccessToken:error: methods are invoked, an 
+ * After the authenticate:error: or authenticateWithPassword:error: methods are invoked, some kind of
  * authentication message is sent to the server.
- * If the server supports digest-md5 sasl authentication, it is used.  Otherwise plain sasl authentication is used,
- * assuming the server supports it.
- * 
- * Now if digest-md5 or X-FACEBOOK-PLATFORM was used, we sent a challenge request, and we're waiting for a 
- * challenge response.  If plain sasl was used, we sent our authentication information, and we're waiting for a 
- * success response.
+ * This method forwards the response to the authentication module, and handles the resulting authentication state.
 **/
 - (void)handleAuth:(NSXMLElement *)authResponse
 {
@@ -3293,7 +3540,7 @@ enum XMPPStreamConfig
 		NSString *srvHost = srvRecord.target;
 		UInt16 srvPort    = srvRecord.port;
 		
-		success = [self connectToHost:srvHost onPort:srvPort error:&connectError];
+		success = [self connectToHost:srvHost onPort:srvPort withTimeout:XMPPStreamTimeoutNone error:&connectError];
 		
 		if (success)
 		{
@@ -3315,11 +3562,13 @@ enum XMPPStreamConfig
 		// 
 		// In other words, just try connecting to the domain specified in the JID.
 		
-		success = [self connectToHost:[myJID_setByClient domain] onPort:5222 error:&connectError];
+		success = [self connectToHost:[myJID_setByClient domain] onPort:5222 withTimeout:XMPPStreamTimeoutNone error:&connectError];
 	}
 	
 	if (!success)
 	{
+		[self endConnectTimeout];
+		
 		state = STATE_XMPP_DISCONNECTED;
 		
 		[multicastDelegate xmppStreamDidDisconnect:self withError:connectError];
@@ -3369,6 +3618,8 @@ enum XMPPStreamConfig
 	// The TCP connection is now established.
 	
 	XMPPLogTrace();
+    
+    [self endConnectTimeout];
 	
 	#if TARGET_OS_IPHONE
 	{
@@ -3483,6 +3734,8 @@ enum XMPPStreamConfig
 	// This method is invoked on the xmppQueue.
 	
 	XMPPLogTrace();
+    
+    [self endConnectTimeout];
 	
 	if (srvResults && (++srvResultsIndex < [srvResults count]))
 	{
@@ -3499,6 +3752,8 @@ enum XMPPStreamConfig
 		
 		// Clear any saved authentication information
 		auth = nil;
+		
+		authenticationDate = nil;
 		
 		// Clear stored elements
 		myJID_setByServer = nil;
@@ -4069,6 +4324,17 @@ enum XMPPStreamConfig
 		block();
 	else
 		dispatch_sync(xmppQueue, block);
+}
+
+- (void)enumerateModulesOfClass:(Class)aClass withBlock:(void (^)(XMPPModule *module, NSUInteger idx, BOOL *stop))block
+{
+    [self enumerateModulesWithBlock:^(XMPPModule *module, NSUInteger idx, BOOL *stop)
+    {
+        if([module isKindOfClass:aClass])
+        {
+            block(module,idx,stop);
+        }
+    }];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

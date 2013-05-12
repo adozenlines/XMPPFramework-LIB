@@ -1,134 +1,222 @@
 //
 //  XMPPLastActivity.m
-//  XMPPFramework
+//  XEP-0012
 //
-//  Created by Sean Batson on 12-07-01.
-//  Copyright (c) 2012 Baseva, Inc. All rights reserved.
+//  Created by Daniel Rodríguez Troitiño on 1/26/2013.
+//
 //
 
 #import "XMPPLastActivity.h"
-#import "XMPP.h"
+#import "XMPPIDTracker.h"
+#import "XMPPIQ+LastActivity.h"
+#import "XMPPFramework.h"
 
 #if ! __has_feature(objc_arc)
 #warning This file must be compiled with ARC. Use -fobjc-arc flag (or convert project to ARC).
 #endif
-#define INTEGRATE_WITH_CAPABILITIES 1
 
-#if INTEGRATE_WITH_CAPABILITIES
-#import "XMPPCapabilities.h"
-#endif
+static const NSTimeInterval XMPPLastActivityDefaultTimeout = 30.0;
 
-#if TARGET_OS_IPHONE  
-#import <UIKit/UIKit.h>
-#endif
 
-#define kModuleNameSpace  @"jabber:iq:last"
+@interface XMPPLastActivity ()
+
+@property (atomic, strong) XMPPIDTracker *queryTracker;
+
+@end
+
 
 @implementation XMPPLastActivity
 
+@synthesize respondsToQueries = _respondsToQueries;
+@synthesize queryTracker = _queryTracker;
 
-- (void)requestWhenLastSeen:(XMPPJID *)jid
+- (id)init
 {
-    NSXMLElement *query = [NSXMLElement elementWithName:@"query" xmlns:kModuleNameSpace];
-    
-    XMPPIQ *iq = [XMPPIQ iqWithType:@"get" to:jid elementID:[xmppStream generateUUID]];
-    [iq addChild:query];
-    
-    [xmppStream sendElement:iq];
+	return [self initWithDispatchQueue:NULL];
 }
- 
+
+- (id)initWithDispatchQueue:(dispatch_queue_t)queue
+{
+	if ((self = [super initWithDispatchQueue:queue]))
+	{
+		_respondsToQueries = YES;
+	}
+    
+	return self;
+}
 
 - (BOOL)activate:(XMPPStream *)aXmppStream
 {
-    if ([super activate:aXmppStream])
-    {
-#if INTEGRATE_WITH_CAPABILITIES
-        [xmppStream autoAddDelegate:self delegateQueue:moduleQueue toModulesOfClass:[XMPPCapabilities class]];
+	if ([super activate:aXmppStream])
+	{
+#ifdef _XMPP_CAPABILITIES_H
+		[xmppStream autoAddDelegate:self delegateQueue:moduleQueue toModulesOfClass:[XMPPCapabilities class]];
 #endif
+        
+		_queryTracker = [[XMPPIDTracker alloc] initWithDispatchQueue:moduleQueue];
+        
+		return YES;
+	}
     
-        return YES;
-    }
-
-    return NO;
+	return NO;
 }
 
 - (void)deactivate
 {
-#if INTEGRATE_WITH_CAPABILITIES
-    [xmppStream removeAutoDelegate:self delegateQueue:moduleQueue fromModulesOfClass:[XMPPCapabilities class]];
+#ifdef _XMPP_CAPABILITIES_H
+	[xmppStream removeAutoDelegate:self delegateQueue:moduleQueue fromModulesOfClass:[XMPPCapabilities class]];
 #endif
     
-    dispatch_block_t block = ^{
-        
-    };
+	dispatch_block_t block = ^{ @autoreleasepool {
+		[_queryTracker removeAllIDs];
+		_queryTracker = nil;
+	}};
     
-    if (dispatch_get_specific(moduleQueueTag))
-        block();
-    else
-        dispatch_sync(moduleQueue, block);
+	if (dispatch_get_current_queue() == moduleQueue)
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
     
     [super deactivate];
 }
 
+- (BOOL)respondsToQueries
+{
+	if (dispatch_get_current_queue() == moduleQueue)
+	{
+		return _respondsToQueries;
+	}
+	else
+	{
+		__block BOOL result;
+        
+		dispatch_sync(moduleQueue, ^{
+			result = _respondsToQueries;
+		});
+        
+		return result;
+	}
+}
 
+- (void)setRespondsToQueries:(BOOL)respondsToQueries
+{
+	dispatch_block_t block = ^{
+		if (_respondsToQueries != respondsToQueries)
+		{
+			_respondsToQueries = respondsToQueries;
+            
+#ifdef _XMPP_CAPABILITIES_H
+			@autoreleasepool {
+				// Capabilities may have changed, need to notify others
+				[xmppStream resendMyPresence];
+			}
+#endif
+		}
+	};
+    
+	if (dispatch_get_current_queue() == moduleQueue)
+		block();
+	else
+		dispatch_sync(moduleQueue, block);
+}
+
+- (NSString *)sendLastActivityQueryToJID:(XMPPJID *)jid
+{
+	return [self sendLastActivityQueryToJID:jid withTimeout:XMPPLastActivityDefaultTimeout];
+}
+
+- (NSString *)sendLastActivityQueryToJID:(XMPPJID *)jid withTimeout:(NSTimeInterval)timeout
+{
+	XMPPIQ *query = [XMPPIQ lastActivityQueryTo:jid];
+	NSString *queryID = query.elementID;
+    
+	dispatch_async(moduleQueue, ^{
+		__weak __typeof__(self) self_weak_ = self;
+		[_queryTracker addID:queryID block:^(XMPPIQ *iq, id<XMPPTrackingInfo> info) {
+			__strong __typeof__(self) self = self_weak_;
+			if (iq)
+			{
+				[self delegateDidReceiveResponse:iq];
+			}
+			else
+			{
+				[self delegateDidNotReceiveResponse:info.elementID dueToTimeout:info.timeout];
+			}
+		} timeout:timeout];
+        
+		[xmppStream sendElement:query];
+	});
+    
+	return queryID;
+}
 
 - (BOOL)xmppStream:(XMPPStream *)sender didReceiveIQ:(XMPPIQ *)iq
 {
-    NSString *type = [[iq attributeForName:@"type"] stringValue];
+	NSString *type = [iq type];
     
-    if ([type isEqualToString:@"result"])
-    {
-        NSXMLElement *lastseen = [iq elementForName:@"query" xmlns:kModuleNameSpace];
-        if (lastseen)
-        {
-            [multicastDelegate xmppLastSeen:self didResponseWithLastSeenIQ:iq];
-        }
+	if (([type isEqualToString:@"result"] || [type isEqualToString:@"error"]))
+	{
+		return [_queryTracker invokeForID:iq.elementID withObject:iq];
+	}
+	else if (_respondsToQueries && [type isEqualToString:@"get"] && [iq isLastActivityQuery])
+	{
+		NSUInteger seconds = [self delegateNumberOfIdleTimeSecondsWithIQ:iq];
+		XMPPIQ *response = [XMPPIQ lastActivityResponseToIQ:iq withSeconds:seconds];
+		[sender sendElement:response];
         
-    }
-    else if ([type isEqualToString:@"get"])
-    {
-        NSXMLElement *lastseen = [iq elementForName:@"query" xmlns:kModuleNameSpace];
-        if (lastseen)
-        {
-            NSXMLElement *query = [NSXMLElement elementWithName:@"query" xmlns:kModuleNameSpace];
-            
-            [query addAttributeWithName:@"seconds" stringValue:@"0"];
-            XMPPIQ *iqresult = [XMPPIQ iqWithType:@"result" to:[iq from] elementID:[iq elementID]];
-            [iqresult addChild:query];
-            [sender sendElement:iqresult]; 
-
-            return YES;
-        }
-        
-    } 
-    else if ([type isEqualToString:@"error"]) {
-        NSXMLElement *lastseen = [iq elementForName:@"query" xmlns:kModuleNameSpace];
-        if (lastseen)
-        {
-            [multicastDelegate xmppLastSeen:self didResponseWithLastSeenError:iq];
-        }
-    }
+		return YES;
+	}
     
-    return NO;
+	return NO;
 }
 
-#if INTEGRATE_WITH_CAPABILITIES
-/**
- * If an XMPPCapabilites instance is used we want to advertise our support for vcards.
- **/
+- (void)xmppStreamDidDisconnect:(XMPPStream *)sender withError:(NSError *)error
+{
+	[_queryTracker removeAllIDs];
+}
+
+#ifdef _XMPP_CAPABILITIES_H
+// If an XMPPCapabilities instance is used we want to advertise our support for last activity.
 - (void)xmppCapabilities:(XMPPCapabilities *)sender collectingMyCapabilities:(NSXMLElement *)query
 {
-    // <query xmlns="http://jabber.org/protocol/disco#info">
-    //   ...
-    //   <feature var="jabber:iq:version"/>
-    //   ...
-    // </query>
-    
-    NSXMLElement *feature = [NSXMLElement elementWithName:@"feature"];
-    [feature addAttributeWithName:@"var" stringValue:kModuleNameSpace];
-    [query addChild:feature];
-    
+	if (_respondsToQueries)
+	{
+		NSXMLElement *feature = [NSXMLElement elementWithName:@"feature"];
+		[feature addAttributeWithName:@"var" stringValue:XMPPLastActivityNamespace];
+        
+		[query addChild:feature];
+	}
 }
 #endif
+
+- (void)delegateDidReceiveResponse:(XMPPIQ *)response
+{
+	[multicastDelegate xmppLastActivity:self didReceiveResponse:response];
+}
+
+- (void)delegateDidNotReceiveResponse:(NSString *)queryID dueToTimeout:(NSTimeInterval)timeout
+{
+	[multicastDelegate xmppLastActivity:self didNotReceiveResponse:queryID dueToTimeout:timeout];
+}
+
+- (NSUInteger)delegateNumberOfIdleTimeSecondsWithIQ:(XMPPIQ *)iq
+{
+	__block NSUInteger idleSeconds = NSNotFound;
+    
+	GCDMulticastDelegateEnumerator *delegateEnumerator = [multicastDelegate delegateEnumerator];
+    
+	id delegate;
+	dispatch_queue_t delegateQueue;
+	SEL selector = @selector(numberOfIdleTimeSecondsForXMPPLastActivity:queryIQ:currentIdleTimeSeconds:);
+    
+	while ([delegateEnumerator getNextDelegate:&delegate delegateQueue:&delegateQueue forSelector:selector])
+	{
+		dispatch_sync(delegateQueue, ^{ @autoreleasepool {
+			idleSeconds = [delegate numberOfIdleTimeSecondsForXMPPLastActivity:self queryIQ:iq currentIdleTimeSeconds:idleSeconds];
+		}});
+	}
+    
+	return idleSeconds == NSNotFound ? 0 : idleSeconds;
+}
 
 @end
