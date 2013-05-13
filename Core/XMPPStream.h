@@ -37,6 +37,7 @@ enum XMPPStreamErrorCode
 };
 typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
 
+extern const NSTimeInterval XMPPStreamTimeoutNone;
 
 @interface XMPPStream : NSObject <GCDAsyncSocketDelegate>
 
@@ -237,7 +238,6 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
 /**
  * Returns YES is the connection is currently connecting
 **/
-
 - (BOOL)isConnecting;
 
 /**
@@ -254,9 +254,10 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
 
 /**
  * Connects to the configured hostName on the configured hostPort.
+ * The timeout is optional. To not time out use XMPPStreamTimeoutNone.
  * If the hostName or myJID are not set, this method will return NO and set the error parameter.
 **/
-- (BOOL)connect:(NSError **)errPtr;
+- (BOOL)connectWithTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr;
 
 /**
  * THIS IS DEPRECATED BY THE XMPP SPECIFICATION.
@@ -264,19 +265,21 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
  * The xmpp specification outlines the proper use of SSL/TLS by negotiating
  * the startTLS upgrade within the stream negotiation.
  * This method exists for those ancient servers that still require the connection to be secured prematurely.
- * 
+ * The timeout is optional. To not time out use XMPPStreamTimeoutNone.
+ *
  * Note: Such servers generally use port 5223 for this, which you will need to set.
 **/
-- (BOOL)oldSchoolSecureConnect:(NSError **)errPtr;
+- (BOOL)oldSchoolSecureConnectWithTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr;
 
 /**
  * Starts a P2P connection to the given user and given address.
+ * The timeout is optional. To not time out use XMPPStreamTimeoutNone.
  * This method only works with XMPPStream objects created using the initP2P method.
  * 
  * The given address is specified as a sockaddr structure wrapped in a NSData object.
  * For example, a NSData object returned from NSNetservice's addresses method.
 **/
-- (BOOL)connectTo:(XMPPJID *)remoteJID withAddress:(NSData *)remoteAddr error:(NSError **)errPtr;
+- (BOOL)connectTo:(XMPPJID *)remoteJID withAddress:(NSData *)remoteAddr withTimeout:(NSTimeInterval)timeout error:(NSError **)errPtr;
 
 /**
  * Starts a P2P connection with the given accepted socket.
@@ -451,8 +454,7 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
 
 /**
  * Returns whether or not the xmpp stream is currently authenticating with the XMPP Server.
- **/
-
+**/
 - (BOOL)isAuthenticating;
 
 /**
@@ -630,6 +632,12 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
  * This may be useful if the stream needs to be queried for modules of a particular type.
 **/
 - (void)enumerateModulesWithBlock:(void (^)(XMPPModule *module, NSUInteger idx, BOOL *stop))block;
+
+/**
+ * Allows for enumeration of the currently registered modules that are a kind of Class.
+ * idx is in relation to all modules not just those of the given class.
+**/
+- (void)enumerateModulesOfClass:(Class)aClass withBlock:(void (^)(XMPPModule *module, NSUInteger idx, BOOL *stop))block;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Utilities
@@ -908,6 +916,11 @@ typedef enum XMPPStreamErrorCode XMPPStreamErrorCode;
  * It may be used to determine if a disconnection was purposeful, or due to an error.
 **/
 - (void)xmppStreamWasToldToDisconnect:(XMPPStream *)sender;
+
+/**
+ * This methods is called if the XMPP Stream's connect times out
+**/
+- (void)xmppStreamConnectDidTimeout:(XMPPStream *)sender;
 
 /**
  * This method is called after the stream is closed.

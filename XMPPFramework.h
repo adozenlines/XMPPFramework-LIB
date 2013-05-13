@@ -42,7 +42,7 @@
 #import "XMPPLastActivity.h"
 #import "XMPPRoster.h"
 #import "XMPPvCardTempModule.h"
-
+#import "XMPPvCardTemp.h"
 //#import "XMPPPubSub.h"
 //#import "XMPPTransports.h"
 //#import "XMPPCapabilities.h"

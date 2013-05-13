@@ -135,7 +135,7 @@ static NSMutableArray *proxyServer;
         
     };
     
-    if (dispatch_get_current_queue() == moduleQueue)
+    if (dispatch_get_specific(moduleQueueTag))
         block();
     else
         dispatch_sync(moduleQueue, block);
@@ -152,10 +152,17 @@ static NSMutableArray *proxyServer;
     NSXMLElement *reqexp = [NSXMLElement elementWithName:@"expire" stringValue:@"1200"];
     [regreq addChild:reqexp];
     
-    XMPPIQ *iq = [XMPPIQ iqWithType:@"set" to:[XMPPJID jidWithString:@"pass.baseva.com"] elementID:[xmppStream generateUUID]];
-    [iq addChild:reqexp];
+    NSString *proxyCanadidate = nil;
     
-    [xmppStream sendElement:iq];
+    if (proxyServer.count) {
+        proxyCanadidate = [NSString stringWithFormat:@"pass.%@", proxyServer[0]];
+
+        XMPPIQ *iq = [XMPPIQ iqWithType:@"set" to:[XMPPJID jidWithString:proxyCanadidate] elementID:[xmppStream generateUUID]];
+        [iq addChild:reqexp];
+        
+        [xmppStream sendElement:iq];
+    }
+    
     
 }
 
