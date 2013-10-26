@@ -4,7 +4,7 @@
 
 - (BOOL)isMessageCorrection;
 
-- (NSString *)correctedMessageID;
+- (NSString *)correctedMessageElementID;
 
 - (void)addMessageCorrectionWithID:(NSString *)messageCorrectionID;
 
